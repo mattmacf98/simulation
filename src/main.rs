@@ -1,97 +1,83 @@
-use tokio::sync::{mpsc, oneshot, mpsc::Sender};
+use tokio::net::TcpListener;
+use tokio::io::{BufReader, AsyncBufReadExt, AsyncWriteExt};
+use tokio::sync::mpsc;
 
-#[derive(Debug, Clone)]
-pub enum Order {
-    BUY,
-    SELL
-}
-
-#[derive(Debug)]
-pub struct Message {
-    pub order: Order,
-    pub ticker: String,
-    pub amount: f32,
-    pub respond_to: oneshot::Sender<u32>
-}
-
-pub struct OrderBookActor {
-    pub receiver: mpsc::Receiver<Message>,
-    pub total_invested: f32,
-    pub investment_cap: f32
-}
-
-impl OrderBookActor {
-    fn new(receiver: mpsc::Receiver<Message>, investment_cap: f32) -> Self {
-        Self { receiver, total_invested: 0.0, investment_cap }
-    }
-
-    fn handle_message(&mut self, message: Message) {
-        if message.amount + self.total_invested >= self.investment_cap {
-            println!("rejecting purchase, total invested: {}", self.total_invested);
-            let _ = message.respond_to.send(0);
-        } else {
-            self.total_invested += message.amount;
-            println!("processing purchase, total invested: {}", self.total_invested);
-            let _ = message.respond_to.send(1);
-        }
-    }
-
-    async fn run(mut self) {
-        println!("actor is running");
-        while let Some(msg) = self.receiver.recv().await {
-            self.handle_message(msg);
-        }
-    }
-}
-
-struct BuyOrder {
-    pub order: Order,
-    pub ticker: String,
-    pub amount: f32,
-    pub sender: Sender<Message>
-}
-
-impl BuyOrder {
-    fn new(ticker: String, amount: f32, sender: Sender<Message>) -> Self {
-        Self { order: Order::BUY, ticker, amount, sender }
-    }
-
-    async fn send(self) {
-        let (send, recv) = oneshot::channel();
-        let message = Message {
-            order: self.order,
-            amount: self.amount,
-            ticker: self.ticker,
-            respond_to: send
-        };
-        let _ = self.sender.send(message).await;
-        match recv.await {
-            Ok(outcome) => println!("here is the outcome: {}", outcome),
-            Err(e) => println!("{}", e)
-        }
-    }
-}
+mod actors;
+use actors::{OrderBookActor, BuyOrder, Message};
+mod order_tracker;
+use order_tracker::{TrackerActor, GetTrackerActor, TrackerMessage};
 
 #[tokio::main]
 async fn main() {
-    let (tx, mut rx) = mpsc::channel::<Message>(1);
-    let tx_one = tx.clone();
+    let addr = "127.0.0.1:8080".to_string();
 
-    tokio::spawn(async move {
-        for _ in 0..5 {
-            let but_actor = BuyOrder::new("BYND".to_owned(), 5.5, tx_one.clone());
-            but_actor.send().await;
-        }
-        drop(tx_one);
+    let socket = TcpListener::bind(&addr).await.unwrap();
+    println!("Listening on: {}", addr);
+
+    let (tx, rx) = mpsc::channel::<Message>(1);
+    let (tracker_tx, tracker_rx) = mpsc::channel::<TrackerMessage>(1);
+    let tracker_tx_one = tracker_tx.clone();
+
+    tokio::spawn(async {
+       TrackerActor::new(tracker_rx).run().await;
     });
     tokio::spawn(async move {
-        for _ in 0..5 {
-            let but_actor = BuyOrder::new("PLTR".to_owned(), 5.5, tx.clone());
-            but_actor.send().await;
-        }
-        drop(tx);
+        let order_book_actor = OrderBookActor::new(rx, tracker_tx_one.clone(), 20.0);
+       order_book_actor.run().await;
     });
+    println!("Order book actor running now");
 
-    let actor = OrderBookActor::new(rx, 20.0);
-    actor.run().await;
+    while let Ok((mut stream, peer)) = socket.accept().await {
+        println!("Incoming connection from: {}", peer.to_string());
+        let tx_one = tx.clone();
+        let tracker_tx_two = tracker_tx.clone();
+        tokio::spawn(async move {
+            println!("thread {} starting", peer.to_string());
+            let (reader, mut writer) = stream.split();
+            let mut buf_reader = BufReader::new(reader);
+            let mut buf = vec![];
+
+            loop {
+                match buf_reader.read_until(b'\n', &mut buf).await {
+                    Ok(n) => {
+                        if n == 0 {
+                            println!("EOF received");
+                            break;
+                        }
+
+                        let buf_string = String::from_utf8_lossy(&buf);
+                        let data: Vec<String> = buf_string.split(";")
+                            .map(|x| x.to_string().replace("\n", ""))
+                            .collect();
+                        println!("here is the data {:?}", data);
+                        let command = data[0].clone();
+
+                        match command.as_str() {
+                            "BUY" => {
+                                println!("buy order command processed");
+                                let amount = data[1].parse::<f32>().unwrap();
+                                let order_actor = BuyOrder::new(data[2].clone(), amount, tx_one.clone());
+                                println!("{}: {}", order_actor.ticker, order_actor.amount);
+                                order_actor.send().await;
+                            },
+                            "GET" => {
+                                println!("get order command processed");
+                                let get_actor = GetTrackerActor{ sender: tracker_tx_two.clone() };
+                                let state = get_actor.send().await;
+                                println!("sending back: {:?}", state);
+                                writer.write_all(state.as_bytes()).await.unwrap();
+                            },
+                            _ => {
+                                panic!("{} command not supported", command);
+                            }
+                        }
+                        buf.clear();
+                    }
+                    Err(e) => println!("Error receiving message: {}", e)
+                }
+            }
+
+            println!("thread {} finishing", peer.to_string());
+        });
+    }
 }
